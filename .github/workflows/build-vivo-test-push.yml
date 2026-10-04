@@ -1,0 +1,113 @@
+name: Build vivo-test APK
+
+# 触发：
+#   1) push 到 main 时自动跑（paths 同时兼容新旧文件名）
+#   2) 也可手动 dispatch，ref 可覆盖
+# 目标：编 vivo-test tag (commit 583b13f) 的 debug APK，无需签名 secret
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-vivo-test-push.yml'
+      - '.github/workflows/build-vivo-test.yml'
+      - 'src/**'
+      - 'app/**'
+      - 'build.gradle'
+      - 'build.gradle.kts'
+      - 'settings.gradle'
+      - 'settings.gradle.kts'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (default: vivo-test tag)'
+        required: false
+        default: 'vivo-test'
+        type: string
+
+env:
+  ONDK_VERSION: "r30.1"
+
+jobs:
+  build-apk:
+    name: Build APK (vivo-test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (vivo-test)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || 'vivo-test' }}
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'zulu'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache ONDK
+        id: ondk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ondk
+          key: ondk-${{ env.ONDK_VERSION }}-linux
+          restore-keys: |
+            ondk-${{ env.ONDK_VERSION }}-
+
+      - name: Download ONDK
+        if: steps.ondk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          url="https://github.com/topjohnwu/ondk/releases/download/${ONDK_VERSION}/ondk-${ONDK_VERSION}-linux.tar.xz"
+          mkdir -p "${RUNNER_TEMP}/ondk"
+          curl -fL "$url" -o /tmp/ondk.tar.xz
+          tar -C "${RUNNER_TEMP}/ondk" --strip-components=1 -xf /tmp/ondk.tar.xz
+          echo "ONDK ready:"
+          ls "${RUNNER_TEMP}/ondk"
+
+      - name: Link ONDK Rust toolchain
+        run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
+
+      - name: Build extractor (Rust)
+        working-directory: tools/extract_rs
+        run: |
+          cargo test --release --features http || true
+          cargo build --release --features http
+
+      - name: Build Ghostlock native binary
+        env:
+          ANDROID_NDK_HOME: ${{ runner.temp }}/ondk
+          NDK_ROOT: ${{ runner.temp }}/ondk
+        run: |
+          set -e
+          make -C src ghostlock
+          STRIP="${{ runner.temp }}/ondk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -x "$STRIP" ]; then "$STRIP" --strip-all build/native/ghostlock || true; fi
+
+      - name: Build Debug APK (no signing secrets needed)
+        env:
+          ONDK_HOME: ${{ runner.temp }}/ondk
+          ANDROID_NDK_HOME: ${{ runner.temp }}/ondk
+          NDK_ROOT: ${{ runner.temp }}/ondk
+        run: |
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Rename & hash APK
+        run: |
+          set -e
+          mkdir -p out
+          cp build/app/outputs/apk/debug/*.apk out/GhostLock-vivo-test-debug.apk
+          sha256sum out/*.apk | tee out/sha256sum.txt
+          echo "=== out/ ==="
+          ls -la out/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GhostLock-vivo-test-debug
+          path: out/
